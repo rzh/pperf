@@ -7,15 +7,14 @@ import (
 	"log"
 	"math"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 )
 
-var (
-	re_process_line = regexp.MustCompile("([a-zA-Z0-9]+) ([0-9]+) ([0-9.]+): cpu-clock:")
-	re_frame_line   = regexp.MustCompile("([a-z0-9]+) ([^ ]+) ([^ ]+)")
-)
+// var re_process_line = regexp.MustCompile("([a-zA-Z0-9]+) ([0-9]+) ([0-9.]+): cpu-clock:")
+// var re_frame_line = regexp.MustCompile("([a-z0-9]+) ([^ ]+) ([^ ]+)")
+const topN int = 5
+const topFunc bool = true
 
 type Parser interface {
 }
@@ -45,20 +44,20 @@ func parseOneFrame(r *bufio.Scanner, firstLine string) (PerfFrame, error) {
 	// it is already a frame, parse to create a perfFrame struct
 	var pf PerfFrame
 
-	t := re_process_line.FindStringSubmatch(firstLine)
+	t := strings.Split(strings.TrimSpace(firstLine), " ")
 
 	if len(t) > 0 {
-		pf.Process = t[1]
+		pf.Process = t[0]
 		var i int64
 		var f float64
 		var err error
 
-		if i, err = strconv.ParseInt(t[2], 10, 64); err != nil {
+		if i, err = strconv.ParseInt(t[1], 10, 64); err != nil {
 			log.Panicf("Failed to parse PID for line [%s]\n", firstLine)
 		}
 		pf.Pid = i
 
-		if f, err = strconv.ParseFloat(t[3], 64); err != nil {
+		if f, err = strconv.ParseFloat(t[2][:len(t[2])-1], 64); err != nil {
 			return PerfFrame{}, errors.New(fmt.Sprintf("Failed to parse PID for line [%s]\n", firstLine))
 		}
 		pf.TS = f
@@ -72,12 +71,12 @@ func parseOneFrame(r *bufio.Scanner, firstLine string) (PerfFrame, error) {
 		s := strings.TrimSpace(r.Text())
 		t := strings.Split(s, " ")
 
-		fName := strings.Join(t[1:len(t)-1], " ")
-
 		// t := re_frame_line.FindStringSubmatch(strings.Replace(s, ", ", ",", -1))
 
-		if len(t) > 0 {
+		if len(t) > 1 {
 			// process frame
+			//fmt.Println("===", s, len(t))
+			fName := strings.Join(t[1:len(t)-1], " ")
 			pf.Functions = append(pf.Functions, Function{Function: fName, ExecutionSpace: t[len(t)-1]})
 		} else {
 			// frame end
@@ -96,16 +95,16 @@ func ParsePerfScript(f *os.File) (PerfFrames, error) {
 	for scanner.Scan() {
 		s := scanner.Text()
 
-		if re_process_line.MatchString(s) {
+		if s != "" && s[0] != ' ' {
 			// this is the first line of a frame
-			//f, err := parseOneFrame(scanner, s)
+			f, err := parseOneFrame(scanner, s)
 
-			//if err != nil {
-			// do something here
-			//return nil, err
-			//}
+			if err != nil {
+				// do something here
+				return nil, err
+			}
 
-			//frames = append(frames, f)
+			frames = append(frames, f)
 		}
 	}
 
@@ -126,6 +125,40 @@ type FuncCount struct {
 
 type Timeline []TimeSlot
 
+func calculateTopN(topFunctions map[string]int, currentTs float64, currentNumSample int) (times TimeSlot) {
+
+	var topNFunction []string = make([]string, topN, topN)
+	var topNCount [topN]int
+
+	for k, v := range topFunctions {
+		for i := 0; i < topN; i++ {
+			// search bottom up
+			if v > topNCount[i] {
+				tk := topNFunction[i]
+				tv := topNCount[i]
+				topNCount[i] = v
+				topNFunction[i] = k
+				k = tk
+				v = tv
+			}
+		}
+	}
+
+	times.F = make([]FuncCount, topN, topN)
+	times.TS = currentTs
+	times.NumSample = currentNumSample
+
+	for i := 0; i < topN; i++ {
+		times.F[i] = FuncCount{F: Function{Function: topNFunction[i]},
+			Count:      int64(topNCount[i]),
+			Percentage: 100 * float64(topNCount[i]) / float64(currentNumSample),
+		}
+
+	}
+
+	return
+}
+
 // parse *os.File and produce a timeline
 func ParsePerfScriptTimeline(f *os.File) (Timeline, error) {
 	var timeline Timeline
@@ -140,8 +173,6 @@ func ParsePerfScriptTimeline(f *os.File) (Timeline, error) {
 	log.Println("parse file done")
 
 	// find top N common used top function
-	const topN int = 5
-	const topFunc bool = true
 
 	var currentTs float64
 	var currentNumSample int
@@ -163,37 +194,8 @@ func ParsePerfScriptTimeline(f *os.File) (Timeline, error) {
 		} else {
 			// a new timeslot
 			// find topN for this frame
-			var topNFunction [topN]string
-			var topNCount [topN]int
-			var times TimeSlot
 
-			for k, v := range topFunctions {
-				for i := 0; i < topN; i++ {
-					// search bottom up
-					if v > topNCount[i] {
-						tk := topNFunction[i]
-						tv := topNCount[i]
-						topNCount[i] = v
-						topNFunction[i] = k
-						k = tk
-						v = tv
-					}
-				}
-			}
-
-			times.F = make([]FuncCount, topN, topN)
-
-			fmt.Printf("Current TS: %10.0f\n", math.Floor(currentTs))
-			for i := 0; i < topN; i++ {
-				times.F = append(times.F, FuncCount{F: Function{Function: topNFunction[i]},
-					Count:      int64(topNCount[i]),
-					Percentage: 100 * float64(topNCount[i]) / float64(currentNumSample),
-				})
-				fmt.Printf("\t%25s : %-4d [%3.2f%%]\n", topNFunction[i], topNCount[i],
-					100*float64(topNCount[i])/float64(currentNumSample))
-			}
-
-			timeline = append(timeline, TimeSlot{NumSample: currentNumSample})
+			timeline = append(timeline, calculateTopN(topFunctions, currentTs, currentNumSample))
 			topFunctions = make(map[string]int)
 			currentTs = 0
 			currentNumSample = 0
@@ -201,8 +203,24 @@ func ParsePerfScriptTimeline(f *os.File) (Timeline, error) {
 	}
 
 	// we need add the last frame
-	timeline = append(timeline, TimeSlot{NumSample: currentNumSample})
+	if currentTs > 0 {
+		timeline = append(timeline, calculateTopN(topFunctions, currentTs, currentNumSample))
+	}
 
 	log.Println("done for all tasks")
 	return timeline, nil
+}
+
+func PrintPerfTimeline(tl Timeline) {
+	for _, t := range tl {
+		fmt.Printf("\nTimestamp: %10.0f\n", math.Floor(t.TS))
+		for i := 0; i < topN; i++ {
+			if len(t.F[i].F.Function) <= 40 {
+				fmt.Printf("    %40s :%4d [%5.2f%%]\n", t.F[i].F.Function, t.F[i].Count, t.F[i].Percentage)
+
+			} else {
+				fmt.Printf("    %40s :%4d [%5.2f%%]\n", t.F[i].F.Function[:35]+".....", t.F[i].Count, t.F[i].Percentage)
+			}
+		}
+	}
 }
